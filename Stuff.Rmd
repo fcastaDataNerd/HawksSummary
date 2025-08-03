@@ -1,0 +1,517 @@
+---
+title: "Stuff"
+author: "Franco C"
+date: "2025-02-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+hist=read_excel("C:\\Users\\franc\\OneDrive\\Hawks25\\NECBLHISTORY_combined.xlsx")
+```
+
+
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(caret)
+
+
+hist <- hist %>%
+  filter(!is.na(AutoPitchType), 
+         AutoPitchType != "Other", 
+         PitchCall != "Undefined", 
+         PitchCall != "BallIntentional", 
+         PitcherThrows != "Both", 
+         BatterSide != "Undefined",
+         !is.na(SpinRate))
+
+
+hist <- hist %>%
+  mutate(
+      PitchCall = case_when(
+      PitchCall %in% c("StikeCalled", "Strikecalled") ~ "StrikeCalled",
+      PitchCall == "BallinDirt" ~ "BallCalled",
+      PitchCall %in% c("FoulBall", "FoulBallNotFieldable", "FoulBallFieldable") ~ "Foul",
+      PitchCall == "InPlay" & PlayResult %in% c("Single", "Double", "Triple", "HomeRun") ~ PlayResult,
+      PitchCall == "InPlay" ~ "Out",
+      TRUE ~ PitchCall
+    ),
+    BatterSide = ifelse(BatterSide == "RIght", "Right", BatterSide),
+    PitcherThrows = ifelse(PitcherThrows == "RIght", "Right", PitcherThrows)
+  ) %>%
+  mutate(
+    Balls = factor(Balls, levels = c(0,1,2,3), ordered = TRUE),
+    Strikes = factor(Strikes, levels = c(0,1,2), ordered = TRUE),
+    PitchCall = factor(PitchCall),
+    PitcherThrows = factor(PitcherThrows, levels = c("Left", "Right")),
+    BatterSide = factor(BatterSide, levels = c("Left", "Right"))
+  )
+
+```
+
+```{r}
+# Get frequency table of PitchCall
+outcome_freq <- hist %>%
+  count(PitchCall) %>%
+  mutate(
+    percent = round(100 * n / sum(n), 2)
+  ) %>%
+  arrange(desc(percent))
+
+print(outcome_freq)
+
+```
+
+
+```{r}
+library(caret)
+set.seed(2425)  
+
+
+train_index <- createDataPartition(hist$PitchCall, p = 0.7, list = FALSE) 
+train <- hist[train_index, ]
+vali <- hist[-train_index, ]
+
+```
+
+```{r}
+set.seed(2425)
+library(randomForest)
+
+rf_model <- randomForest(
+  PitchCall ~ PitcherThrows+BatterSide+Balls+Strikes+RelSpeed+SpinRate+InducedVertBreak+HorzBreak+PlateLocHeight+PlateLocSide,
+  data = train,  
+  ntree = 250,  
+  mtry = sqrt(10), #three vars randomly chosen at each node split in tree
+  importance = TRUE,
+)
+
+print(rf_model)
+```
+misclassify 45% of pitches (OOB). Not terrible considering the # of classes
+class.error is misclassification per class. 11% of balls misclassified. Since so many classes expect significant errors. Probability calibration is crucial
+
+
+```{r}
+varImpPlot(rf_model, main = "Feature Importance in Random Forest")
+
+rf_pred <- predict(rf_model, newdata = vali)
+
+# Compute Confusion Matrix
+conf_matrix <- confusionMatrix(rf_pred, vali$PitchCall)
+print(conf_matrix)
+
+#some variables that are seemingly useless in the VIP should intuitively be kept. Pitcher and batter dexterity for example. Or count. 
+#Overall accuracy is good relative to NIR. Significant improvement. 
+#Sensitivity for in play outcomes are really poor. But I'm thinking maybe that makes sense since events like singles or doubles are extremely rare when considering all pitches. I think balls are plurality class at 38.72%. Since those events are so rare and we are using majority voting it makes sense that model would almost never give a single or double a plurality probability. 
+```
+```{r}
+rf_prob <- predict(rf_model, newdata = vali, type = "prob")
+
+y_actual <- model.matrix(~ PitchCall - 1, data = vali)
+
+brier_score <- mean(rowSums((rf_prob - y_actual)^2) / ncol(y_actual))
+cat("Brier Score:", brier_score, "\n")
+#good
+```
+
+
+```{r}
+preds <- as.data.frame(rf_prob)
+
+preds$Actual <- vali$PitchCall #actual outcome
+preds$Predicted <- predict(rf_model, newdata = vali) #predicted class (most likely)
+preds$Strike=preds$StrikeCalled+preds$StrikeSwinging
+preds <- cbind(preds, vali[, c("PitcherThrows", "BatterSide", "Balls", "Strikes", "AutoPitchType", "RelSpeed", "SpinRate", "InducedVertBreak", "HorzBreak", "PlateLocHeight", "PlateLocSide")])
+```
+
+
+
+
+```{r}
+preds <- preds %>%
+  mutate(
+    Pitcher = vali$Pitcher,
+    ActualRunValue = case_when(
+      Strikes %in% c(0, 1) & Actual == "BallCalled" ~ 0.056,
+      Strikes %in% c(0, 1) & Actual %in% c("StrikeCalled", "StrikeSwinging", "Foul") ~ -0.089,
+      Strikes == 2 & Actual == "BallCalled" ~ 0.056,
+      Strikes == 2 & Actual %in% c("StrikeCalled", "StrikeSwinging") ~ -0.089, #change to -0.26 since it is an out?
+      Actual == "Out"        ~ -0.26,
+      Actual == "Single"     ~ 0.44,
+      Actual == "Double"     ~ 0.75,
+      Actual == "Triple"     ~ 1.01,
+      Actual == "HomeRun"    ~ 1.40,
+      Actual == "HitByPitch" ~ 0.31,
+      TRUE ~ 0  # Just in case there's anything unaccounted for
+    )
+  )
+#estimated average run value of each event (MLB)
+```
+
+
+
+```{r}
+# Run value weights
+# Out = -0.25, Single = 0.47, Double = 0.78, Triple = 1.09, HR = 1.40
+
+preds <- preds %>%
+  mutate(
+    xRunValue = case_when(
+      Strikes %in% c(0, 1) ~ 
+        0.056 * BallCalled -
+        0.089 * (StrikeCalled + StrikeSwinging + Foul) +
+        0.44  * Single +
+        0.75  * Double +
+        1.01  * Triple +
+        1.40  * HomeRun -
+        0.26 * Out +
+        0.31  * HitByPitch,
+
+      Strikes == 2 ~ 
+        0.056 * BallCalled -
+        0.089 * (StrikeCalled + StrikeSwinging) +
+        0.44  * Single +
+        0.75  * Double +
+        1.01  * Triple +
+        1.40  * HomeRun -
+        0.26 * Out +
+        0.31  * HitByPitch
+    )
+  )
+#expected run value of each pitch using model probabilities
+```
+
+```{r}
+pitcher_summary <- preds %>%
+  group_by(Pitcher) %>%
+  summarise(
+    avg_xRunValue = mean(xRunValue, na.rm = TRUE), #average expected run value for all pitches
+    avg_ActualRunValue = mean(ActualRunValue, na.rm = TRUE), #average actual run value based on outcomes
+    pitches = n()
+  ) %>%
+  mutate(
+    avg_xRunValue = round(avg_xRunValue, 5),
+    avg_ActualRunValue = round(avg_ActualRunValue, 5),
+    difference = round(avg_ActualRunValue - avg_xRunValue, 5)
+  ) %>%
+  arrange(difference)
+#average actual run value and expected for each pitcher
+
+```
+```{r}
+sum(pitcher_summary$avg_xRunValue)
+sum(pitcher_summary$avg_ActualRunValue)
+mean(pitcher_summary$avg_xRunValue)
+mean(pitcher_summary$avg_ActualRunValue)
+sum(preds$ActualRunValue)
+sum(preds$xRunValue)
+mean(preds$ActualRunValue)
+mean(preds$xRunValue)
+#elite validation performance. sums and means of expected vs actual are almost identical
+```
+
+
+```{r}
+# One-hot encode actual classes
+y_true <- model.matrix(~ PitchCall - 1, data = vali)
+
+# Compute Brier score per class
+brier_per_class <- colMeans((rf_prob - y_true)^2)
+
+# Clean output
+brier_per_class <- round(brier_per_class, 5)
+print(brier_per_class)
+
+#most are good, some are decent (foul)
+```
+
+```{r}
+saveRDS(rf_model, file = "C:/Users/franc/OneDrive/Hawks25/rf_model_2025.rds")
+
+```
+
+
+```{r}
+# Load and prepare
+library(readr)
+library(dplyr)
+library(stringr)
+
+
+# Load data
+hist24 <- read_csv("C:/Users/franc/OneDrive/NECBLHISTORY/Test2025/Master/Test2025_combined.csv")
+
+
+# Remove August games and format pitcher name
+hist24 <- hist24 %>%
+   filter(
+    substr(Date, 1, 4) == "2025",
+    substr(Date, 6, 7) != "08"
+  ) %>%
+  mutate(
+    PitcherFormatted = str_to_upper(sub("^(.*),\\s*(\\w).*", "\\1, \\2", Pitcher)),
+    PitcherFormatted = str_replace_all(PitcherFormatted, "[‘’'`]", ""),
+    PitcherTeam = str_trim(PitcherTeam)
+  )
+
+```
+
+```{r}
+hist24 <- hist24 %>%
+  mutate(
+    PitcherThrows = str_trim(PitcherThrows),
+    BatterSide = str_trim(BatterSide),
+    PitcherThrows = ifelse(PitcherThrows == "RIght", "Right", PitcherThrows),
+    BatterSide = ifelse(BatterSide == "RIght", "Right", BatterSide)
+  ) %>%
+  filter(
+    !is.na(PitcherThrows),
+    !is.na(BatterSide),
+    !is.na(Strikes),
+    PitcherThrows %in% c("Left", "Right"),
+    BatterSide %in% c("Left", "Right"),
+    !is.na(AutoPitchType),
+    AutoPitchType != "Other",
+    PitchCall != "Undefined",
+    PitchCall != "BallIntentional",
+    !is.na(SpinRate)
+  ) %>%
+  mutate(
+    PitchCall = case_when(
+      PitchCall %in% c("StikeCalled", "Strikecalled") ~ "StrikeCalled",
+      PitchCall == "BallinDirt" ~ "BallCalled",
+      PitchCall %in% c("FoulBall", "FoulBallNotFieldable", "FoulBallFieldable") ~ "Foul",
+      PitchCall == "InPlay" & PlayResult %in% c("Single", "Double", "Triple", "HomeRun") ~ PlayResult,
+      PitchCall == "InPlay" ~ "Out",
+      TRUE ~ PitchCall
+    ),
+    Balls = factor(Balls, levels = c(0,1,2,3), ordered = TRUE),
+    Strikes = factor(Strikes, levels = c(0,1,2), ordered = TRUE),
+    PitcherThrows = factor(PitcherThrows, levels = c("Left", "Right")),
+    BatterSide = factor(BatterSide, levels = c("Left", "Right"))
+  )
+
+colSums(is.na(hist24))
+```
+
+
+
+```{r}
+hist24 <- hist24 %>%
+  mutate(
+    ActualRunValue = case_when(
+      Strikes %in% c(0, 1) & PitchCall == "BallCalled" ~ 0.056,
+      Strikes %in% c(0, 1) & PitchCall %in% c("StrikeCalled", "StrikeSwinging", "Foul") ~ -0.089,
+      Strikes == 2 & PitchCall == "BallCalled" ~ 0.056,
+      Strikes == 2 & PitchCall %in% c("StrikeCalled", "StrikeSwinging") ~ -0.089,
+      PitchCall == "Out"        ~ -0.26,
+      PitchCall == "Single"     ~ 0.44,
+      PitchCall == "Double"     ~ 0.75,
+      PitchCall == "Triple"     ~ 1.01,
+      PitchCall == "HomeRun"    ~ 1.40,
+      PitchCall == "HitByPitch" ~ 0.31,
+      TRUE ~ 0
+    )
+  )
+
+```
+
+```{r}
+# Predict probabilities from RF model
+rf_model <- readRDS("C:/Users/franc/OneDrive/Hawks25/rf_model_2025.rds")
+
+rf_prob_2024 <- predict(rf_model, newdata = hist24, type = "prob")
+rf_prob_2024 <- as.data.frame(rf_prob_2024)
+
+
+# Bind to main dataset
+hist24 <- bind_cols(hist24, rf_prob_2024)
+
+```
+
+```{r}
+View(rf_prob_2024)
+```
+
+```{r}
+hist24 <- hist24 %>%
+  mutate(
+    xRunValue = case_when(
+      Strikes %in% c(0, 1) ~ 
+        0.056 * BallCalled -
+        0.089 * (StrikeCalled + StrikeSwinging + Foul) +
+        0.44  * Single +
+        0.75  * Double +
+        1.01  * Triple +
+        1.40  * HomeRun -
+        0.26  * Out +
+        0.31  * HitByPitch,
+
+      Strikes == 2 ~ 
+        0.056 * BallCalled -
+        0.089 * (StrikeCalled + StrikeSwinging) +
+        0.44  * Single +
+        0.75  * Double +
+        1.01  * Triple +
+        1.40  * HomeRun -
+        0.26  * Out +
+        0.31  * HitByPitch
+    )
+  )
+
+```
+
+```{r}
+pitcher_summary_2024 <- hist24 %>%
+  group_by(PitcherFormatted, PitcherTeam) %>%
+  summarise(
+    avg_xRunValue = mean(xRunValue, na.rm = TRUE),
+    avg_ActualRunValue = mean(ActualRunValue, na.rm = TRUE),
+    pitches = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    avg_xRunValue = round(avg_xRunValue, 5),
+    avg_ActualRunValue = round(avg_ActualRunValue, 5),
+    difference = round(avg_ActualRunValue - avg_xRunValue, 5)
+  )
+
+
+```
+
+```{r}
+mean(hist24$xRunValue, na.rm=TRUE)
+mean(hist24$ActualRunValue)
+mean(hist24$xRunValue, na.rm=TRUE) - mean(hist24$ActualRunValue)
+
+
+mean(preds$xRunValue)
+mean(preds$ActualRunValue)
+mean(preds$xRunValue) - mean(preds$ActualRunValue)
+
+```
+```{r}
+sum(hist24$xRunValue, na.rm=TRUE)
+sum(hist24$ActualRunValue)
+sum(hist24$xRunValue, na.rm=TRUE) - sum(hist24$ActualRunValue)
+
+sum(preds$xRunValue)
+sum(preds$ActualRunValue)
+sum(preds$xRunValue) - sum(preds$ActualRunValue)
+```
+
+
+
+```{r}
+t.test(preds$xRunValue, hist24$xRunValue, 
+       alternative = "two.sided", var.equal = FALSE)
+
+
+t.test(hist24$xRunValue, hist24$ActualRunValue, 
+       alternative = "two.sided", paired=TRUE)
+
+
+t.test(preds$xRunValue, preds$ActualRunValue, 
+       alternative = "two.sided", var.equal = FALSE)
+#not a significant difference in expected runs in validation and 2024 datasets, but model miss for 2024 is confirmed with t test between expected and actual. 
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+
+# Load the pitcher stats
+pitching2024 <- read_csv("C:/Users/franc/OneDrive/Hawks25/necbl_combined_pitching_stats.csv")
+
+# Clean pitcher names and team names
+pitching2024 <- pitching2024 %>%
+  mutate(
+    Player = str_to_upper(Player),
+    Player = str_replace_all(Player, "[‘’'`]", ""),
+    Player = str_squish(Player),
+    Team = str_trim(Team)
+  )
+
+# Prepare model-based pitcher summary for merge
+pitcher_summary_2024 <- pitcher_summary_2024 %>%
+  rename(Player = PitcherFormatted, Team = PitcherTeam)
+
+merged_pitchers_2024 <- pitching2024 %>%
+  left_join(pitcher_summary_2024, by = c("Player", "Team"))
+
+```
+```{r}
+t.test(merged_pitchers_2024$avg_xRunValue, merged_pitchers_2024$avg_ActualRunValue, 
+       alternative = "two.sided", paired = TRUE)
+
+t.test(hist24$xRunValue, hist24$ActualRunValue, 
+       alternative = "two.sided", paired = TRUE)
+
+```
+
+
+```{r}
+write_csv(merged_pitchers_2024, "C:/Users/franc/OneDrive/Hawks25/necbl_combined_pitching_stats.csv")
+write_csv(merged_pitchers_2024, "C:/Users/franc/OneDrive/Hawks25/LeagueDataDashboard/necbl_combined_pitching_stats.csv")
+
+
+```
+
+
+
+
+```{r}
+
+t.test(preds$xRunValue, preds$ActualRunValue, 
+       alternative = "two.sided", paired = TRUE)
+```
+
+```{r}
+# Add predicted class (hard label) for confusion matrix
+hist24$PredictedCall <- colnames(rf_prob_2024)[max.col(rf_prob_2024)]
+
+# Ensure factors with consistent levels
+hist24$PitchCall <- factor(hist24$PitchCall)
+hist24$PredictedCall <- factor(hist24$PredictedCall, levels = levels(hist24$PitchCall))
+
+library(caret)
+
+conf_matrix_2025 <- confusionMatrix(hist24$PredictedCall, hist24$PitchCall)
+print(conf_matrix_2025)
+
+# One-hot encode true labels
+y_true_2025 <- model.matrix(~ PitchCall - 1, data = hist24)
+colnames(y_true_2025) <- levels(hist24$PitchCall)
+
+# Predicted probabilities (already stored in rf_prob_2024)
+rf_prob_matrix_2025 <- as.matrix(rf_prob_2024)
+
+# Brier score (mean squared error across all classes)
+brier_score_2025 <- mean(rowSums((rf_prob_matrix_2025 - y_true_2025)^2) / ncol(y_true_2025))
+cat("Brier Score (2025):", round(brier_score_2025, 5), "\n")
+
+# Brier score per class
+brier_per_class_2025 <- colMeans((rf_prob_matrix_2025 - y_true_2025)^2)
+brier_per_class_2025 <- round(brier_per_class_2025, 5)
+print(brier_per_class_2025)
+
+# Convert actual class labels to numeric index for log loss
+true_class_idx <- as.numeric(hist24$PitchCall)
+
+# Extract predicted probability for the true class
+log_probs <- log(rf_prob_matrix_2025[cbind(1:nrow(rf_prob_matrix_2025), true_class_idx)])
+
+# Compute log loss
+log_loss_2025 <- -mean(log_probs)
+cat("Log Loss (2025):", round(log_loss_2025, 5), "\n")
+
+```
+

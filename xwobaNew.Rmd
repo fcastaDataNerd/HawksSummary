@@ -1,0 +1,551 @@
+---
+title: "Untitled"
+author: "Franco C"
+date: "2025-02-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+history=read_excel("C:\\Users\\franc\\OneDrive\\Hawks25\\NECBLHISTORY_combined.xlsx")
+```
+
+```{r}
+# Define the values to keep
+# for the 2025 dataset, the one key adjustment is to avoid dropping rows with an NA in ExitSpeed, Angle, or Direction. necessary for model building but cannot just eliminate actual plays that happened for 2025 otherwise we will underestimate everyone's woba. Fairest thing to do is probably say when one of those three values is missing, the xwoba value is equal to the woba value of whatever the play result was. 
+valid_playresults=c("Single", "Double", "Triple", "HomeRun", 
+"Out", "Error", "FieldersChoice", "Sacrifice")
+
+
+xwoba=subset(history, PlayResult %in% valid_playresults)
+xwoba=subset(xwoba, !is.na(ExitSpeed) & !is.na(Angle) & !is.na(Direction))
+xwoba$PlayResult[xwoba$PlayResult %in% c("FieldersChoice", "Error", "Sacrifice")] <- "Out" #all de facto outs
+xwoba$PlayResult = as.factor(xwoba$PlayResult)
+
+
+```
+
+
+```{r}
+# Load libraries
+library(xgboost)
+library(caret)
+library(dplyr)
+
+# Step 1: Create a Copy of xwoba for Boosting
+BoostDat <- xwoba
+
+# Step 2: Split the dataset into **Training (70%) and Validation (30%)**
+set.seed(69)  # For reproducibility
+train_index <- createDataPartition(BoostDat$PlayResult, p = 0.7, list = FALSE)
+train_data <- BoostDat[train_index, ]
+validation_data <- BoostDat[-train_index, ]
+
+# Step 3: Convert Categorical Target to Numeric
+class_labels <- c("Out", "Single", "Double", "Triple", "HomeRun")  # Explicit order
+train_data$PlayResult <- factor(train_data$PlayResult, levels = class_labels)
+validation_data$PlayResult <- factor(validation_data$PlayResult, levels = class_labels)
+
+train_labels <- as.numeric(train_data$PlayResult) - 1
+validation_labels <- as.numeric(validation_data$PlayResult) - 1
+
+# Define Feature Set
+selected_features <- c("ExitSpeed", "Angle", "Direction")
+
+# Create XGBoost Matrices
+train_matrix <- xgb.DMatrix(data = as.matrix(train_data[, selected_features]), label = train_labels)
+validation_matrix <- xgb.DMatrix(data = as.matrix(validation_data[, selected_features]), label = validation_labels)
+
+# Step 4: Define Best Practice Hyperparameters
+params <- list(
+  objective = "multi:softprob",  
+  num_class = 5,                 
+  eval_metric = "mlogloss", #prob calibration    
+  eta = 0.15, #controls how much model adjusts weights after each boosting round. Larger values risk overfitting                  
+  max_depth = 7,   #max depth of each tree, larger values learn more complex patterns but risk overfitting               
+  subsample = 0.8,   #% of data used per boosting round, 1.0 will potentially overfit, lower values add randomness and may prevent overfitting             
+  colsample_bytree = 1, #% of features used per tree. Since only 3 feautures 1 is fine           
+  min_child_weight = 3, #how much data needed for further split in tree; higher values make model more conservative and prevents smaller splits.           
+  gamma = 0.2 #min loss reduction for a split. Higher vals prevent unnecessary splits                   
+)
+
+# Step 5: **Stratified 5-Fold Cross-Validation**
+cv_results <- xgb.cv(
+  params = params,
+  data = train_matrix,
+  nrounds = 100,  
+  nfold = 5,      
+  stratified = TRUE,  
+  early_stopping_rounds = 10,  
+  verbose = 0
+)
+
+# Extract the best number of rounds
+best_nrounds <- cv_results$best_iteration
+# Print the best log loss
+cat("Best Log Loss:", min(cv_results$evaluation_log$test_mlogloss_mean), "\n")
+
+# Step 6: Train Final Model
+xgb_model <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = best_nrounds,  
+  watchlist = list(train = train_matrix, validation = validation_matrix),
+  verbose = 0
+)
+
+# Step 7: Feature Importance
+importance_matrix <- xgb.importance(
+  feature_names = xgb_model$feature_names,  # Extract from the trained model
+  model = xgb_model
+)
+
+print(importance_matrix)
+xgb.plot.importance(importance_matrix)
+
+# Step 8: Predict on Validation Set
+validation_pred <- predict(xgb_model, validation_matrix)
+validation_pred <- matrix(validation_pred, ncol = 5, byrow = TRUE)
+
+# Get Predicted Class Labels
+validation_pred_labels <- max.col(validation_pred) - 1
+
+# Step 9: Compute Confusion Matrix
+library(caret)
+
+# Ensure all factor levels are properly assigned at creation
+predicted_classes <- factor(validation_pred_labels, levels = 0:4, labels = class_labels)
+actual_classes <- factor(validation_labels, levels = 0:4, labels = class_labels)
+
+# Debugging Step: Verify factor levels match
+print(table(predicted_classes))
+print(table(actual_classes))
+
+# Compute the Confusion Matrix
+conf_matrix_caret <- confusionMatrix(predicted_classes, actual_classes)
+
+# Print the full confusion matrix with additional statistics
+print(conf_matrix_caret)
+
+# Step 10: Compute wOBA
+library(dplyr)
+
+# Convert predictions to a data frame
+predicted_probabilities <- as.data.frame(validation_pred)
+colnames(predicted_probabilities) <- class_labels  # Ensure column names match class labels
+
+# Round probabilities for readability
+predicted_probabilities <- predicted_probabilities %>%
+  mutate(across(everything(), ~ round(., 2))) %>%
+  mutate(
+    ExitSpeed = validation_data$ExitSpeed,
+    Angle = validation_data$Angle,
+    Direction = validation_data$Direction,
+    Actual = factor(validation_labels, levels = 0:4, labels = class_labels),
+    Predicted = factor(max.col(validation_pred) - 1, levels = 0:4, labels = class_labels)
+  )
+
+# Define MLB wOBA Weights
+woba_weights <- c("Out" = 0, "Single" = 0.882, "Double" = 1.254, "Triple" = 1.59, "HomeRun" = 2.05)
+
+# Compute wOBA & xwOBA for Validation Set
+predicted_probabilities <- predicted_probabilities %>%
+  mutate(
+    # Ensure Actual is a character before matching with woba_weights
+    wOBA = as.numeric(case_when(
+      as.character(Actual) == "Out" ~ woba_weights["Out"],
+      as.character(Actual) == "Single" ~ woba_weights["Single"],
+      as.character(Actual) == "Double" ~ woba_weights["Double"],
+      as.character(Actual) == "Triple" ~ woba_weights["Triple"],
+      as.character(Actual) == "HomeRun" ~ woba_weights["HomeRun"]
+    )),
+    
+    # Compute expected wOBA using predicted probabilities
+    xwOBA = (Out * woba_weights["Out"]) +
+            (Single * woba_weights["Single"]) +
+            (Double * woba_weights["Double"]) +
+            (Triple * woba_weights["Triple"]) +
+            (HomeRun * woba_weights["HomeRun"])
+  )
+
+# Debugging: Check for NA values in wOBA
+print(table(predicted_probabilities$wOBA, useNA = "ifany"))
+
+# Compute Average Actual & Expected wOBA
+actual_woba <- mean(predicted_probabilities$wOBA, na.rm = TRUE)
+expected_woba <- mean(predicted_probabilities$xwOBA, na.rm = TRUE)
+
+# Print results
+cat("Average Actual wOBA:", actual_woba, "\n")
+cat("Average Expected wOBA (xwOBA):", expected_woba, "\n")
+sum(predicted_probabilities$wOBA)
+sum(predicted_probabilities$xwOBA)
+
+
+```
+```{r}
+#bip_subset2 <- predicted_probabilities %>%
+ # filter(use_model, !is.na(actual_wOBA), !is.na(xwOBA))
+
+t.test(bip_subset$actual_wOBA, bip_subset$xwOBA, paired = TRUE)
+t.test(predicted_probabilities$wOBA, predicted_probabilities$xwOBA, paired=TRUE)
+```
+
+```{r}
+brier_score <- mean((validation_pred - model.matrix(~ Actual - 1, data = predicted_probabilities))^2)
+cat("Brier Score:", brier_score, "\n")
+log_loss <- -mean(log(validation_pred[cbind(1:nrow(validation_pred), validation_labels + 1)]))
+cat("Log Loss:", log_loss, "\n")
+```
+
+```{r}
+# Step 1: One-hot encode the true labels
+actual_matrix <- model.matrix(~ actual_classes - 1)
+
+# Step 2: Clean up column names to match predicted_probabilities
+colnames(actual_matrix) <- levels(actual_classes)
+
+# Step 3: Ensure predictions are in matrix form
+pred_matrix <- as.matrix(predicted_probabilities[, levels(actual_classes)])
+
+# Step 4: Compute Brier Score per class
+brier_per_class <- colMeans((pred_matrix - actual_matrix)^2)
+
+# Step 5: Round and print
+brier_per_class <- round(brier_per_class, 5)
+print(brier_per_class)
+```
+
+```{r}
+mean(predicted_probabilities$Triple[actual_classes == "Triple"])
+mean(predicted_probabilities$Double[actual_classes == "Double"])
+mean(predicted_probabilities$Single[actual_classes == "Single"])
+mean(predicted_probabilities$HomeRun[actual_classes == "HomeRun"])
+mean(predicted_probabilities$Out[actual_classes == "Out"])
+```
+
+
+
+
+
+
+
+```{r}
+library(dplyr)
+library(readr)
+xgb_model <- readRDS("C:/Users/franc/OneDrive/Hawks25/xgb_xwoba_model.rds")
+
+
+# Load the historical dataset
+history2024 <- read_csv("C:/Users/franc/OneDrive/NECBLHISTORY/Test2025/Master/Test2025_combined.csv")
+
+
+# Define valid play results
+valid_playresults <- c("Single", "Double", "Triple", "HomeRun", "Out", "Error", "FieldersChoice", "Sacrifice") #valid outcomes from PlayResult
+
+# Filter to 2024 only, remove August games, and only keep valid play results
+xwoba2024 <- history2024 %>%
+  filter(
+    substr(Date, 1, 4) == "2025",                          # Year = 2024
+    substr(Date, 6, 7) != "08",                            # Exclude August (playoffs, season dataset only includes regular season)
+    PlayResult %in% valid_playresults                      # Valid play types only. Filtering here
+  ) %>%
+  mutate( #recoding events. When those three, change to out. Else just keep as is
+    PlayResult = case_when(
+      PlayResult %in% c("Error", "FieldersChoice", "Sacrifice") ~ "Out",
+      TRUE ~ PlayResult
+    ),
+    PlayResult = factor(PlayResult, levels = c("Out", "Single", "Double", "Triple", "HomeRun")) #order PlayResult
+  )
+
+```
+
+
+```{r}
+library(xgboost)
+library(dplyr)
+
+# Define weights
+woba_weights <- c("Out" = 0, "Single" = 0.882, "Double" = 1.254, "Triple" = 1.59, "HomeRun" = 2.05)
+
+# Flag rows with complete model input
+xwoba2024 <- xwoba2024 %>%
+  mutate(use_model = !is.na(ExitSpeed) & !is.na(Angle) & !is.na(Direction)) #we will use the model if all three explanatory variables available. 
+
+# Prepare matrix of inputs for prediction
+predict_matrix <- xwoba2024 %>%
+  filter(use_model) %>%
+  select(ExitSpeed, Angle, Direction) %>%
+  as.matrix()
+
+# Predict probabilities using XGBoost
+predicted_probs <- predict(xgb_model, predict_matrix)
+predicted_probs <- matrix(predicted_probs, ncol = 5, byrow = TRUE)
+colnames(predicted_probs) <- names(woba_weights)
+
+# Bind predictions into the main dataframe for rows where model is used
+model_preds_df <- as.data.frame(predicted_probs)
+
+# Now safely insert those predicted columns into xwoba2024
+# Create an index of rows with complete data
+model_row_indices <- which(xwoba2024$use_model)
+
+# Fill those columns into xwoba2024 at the correct positions
+xwoba2024[model_row_indices, names(woba_weights)] <- model_preds_df
+
+# Compute xwOBA for all rows
+xwoba2024 <- xwoba2024 %>%
+  mutate(
+    xwOBA = case_when(
+      use_model ~ Out * woba_weights["Out"] +
+                  Single * woba_weights["Single"] +
+                  Double * woba_weights["Double"] +
+                  Triple * woba_weights["Triple"] +
+                  HomeRun * woba_weights["HomeRun"],
+      TRUE ~ woba_weights[as.character(PlayResult)] #when predictor information is missing, for fairness assign xwOBA to the wOBA value of the actual play result (ex: single=0.882)
+    )
+  )
+
+```
+
+
+```{r}
+# Paired t-test on BIP level
+xwoba2024 <- xwoba2024 %>%
+  mutate(
+    actual_wOBA = woba_weights[as.character(PlayResult)]
+  )
+bip_subset <- xwoba2024 %>%
+  filter(use_model, !is.na(actual_wOBA), !is.na(xwOBA))
+
+t.test(bip_subset$actual_wOBA, bip_subset$xwOBA, paired = TRUE)
+#t test for difference in woba and xwoba among BIP where model is used
+```
+
+```{r}
+library(stringr)
+
+# Step 3.1: Normalize batter name to match format used in stats2024
+# We convert names to: "LASTNAME, F"
+xwoba2024 <- xwoba2024 %>%
+  mutate(
+    BatterFormatted = str_to_upper(sub("^(.*),\\s*(\\w).*", "\\1, \\2", Batter)),
+    BatterFormatted = str_replace_all(BatterFormatted, "[‘’'`]", ""),
+    BatterTeam = str_trim(BatterTeam)
+  )
+
+
+
+player_xwOBA2024 <- xwoba2024 %>%
+  group_by(BatterFormatted, BatterTeam) %>%
+  summarise(
+    total_BIP = n(),                         # Total balls in play
+    sum_xwOBA = sum(xwOBA, na.rm = TRUE),    # Total predicted xwOBA
+    xwOBA_per_BIP = sum_xwOBA / total_BIP,   # Average xwOBA per BIP
+    .groups = "drop"
+  )
+
+
+# Optional: quick check
+head(player_xwOBA2024)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+
+# Load scraped 2024 batting stats
+stats2024 <- read_csv("C:/Users/franc/OneDrive/Hawks25/necbl_combined_batting_stats.csv")
+
+# Standardize Player column in stats2024 only
+stats2024 <- stats2024 %>%
+  mutate(
+    Player = str_to_upper(Player),
+    Player = str_replace_all(Player, "[‘’'`]", ""),
+    Player = str_squish(Player),
+    Team = str_trim(Team)
+  )
+
+# player_xwOBA2024 already has cleaned BatterFormatted and BatterTeam
+# Just rename for merge
+player_xwOBA2024 <- player_xwOBA2024 %>%
+  rename(Player = BatterFormatted, Team = BatterTeam)
+
+# Merge on Player and Team
+merged2024 <- stats2024 %>%
+  left_join(
+    player_xwOBA2024,
+    by = c("Player", "Team")
+  )
+
+# Define wOBA weights
+wBB <- 0.689
+wHBP <- 0.72
+w1B <- 0.882
+w2B <- 1.254
+w3B <- 1.590
+wHR <- 2.050
+
+# Compute wOBA and adjusted xwOBA (no PA column)
+merged2024 <- merged2024 %>%
+  mutate(
+    expected_BIP = AB + SF + SH - SO, 
+    sum_xwOBA_adjusted = xwOBA_per_BIP * expected_BIP, 
+
+    xwOBA = ((wBB * BB) + (wHBP * HBP) + sum_xwOBA) /
+            (AB + BB + SF + HBP),
+    
+    xwOBA_adjusted = ((wBB * BB) + (wHBP * HBP) + sum_xwOBA_adjusted) /
+                     (AB + BB + SF + HBP),
+    
+    diff = xwOBA - wOBA,
+    diff_adjusted = xwOBA_adjusted - wOBA
+  )
+
+#model can either be used, we use the actual wOBA value when info is not there, or the BIP does not exist (mostly occurs because dumb trackman operators forget to start inning or something and miss a BIP). I think fairest thing to do is create this xwOBA_adjusted stat, where we take xwOBA_per_BIP and multiply by the number of BIP they should have and use this quantity in the xwoba calculation. 
+
+```
+
+
+
+
+```{r}
+write_csv(merged2024, "C:/Users/franc/OneDrive/Hawks25/necbl_combined_batting_stats.csv")
+write_csv(merged2024, "C:/Users/franc/OneDrive/Hawks25/LeagueDataDashboard/necbl_combined_batting_stats.csv")
+```
+
+```{r}
+# Step 1: Define wOBA weights
+wBB <- 0.689
+wHBP <- 0.72
+w1B <- 0.882
+w2B <- 1.254
+w3B <- 1.590
+wHR <- 2.050
+
+# Step 2: Calculate total 1B (singles)
+merged2024 <- merged2024 %>%
+  mutate(`1B` = H - `2B` - `3B` - HR)
+
+# Step 3: Compute league-wide totals
+league_totals <- merged2024 %>%
+  summarise(
+    BB = sum(BB, na.rm = TRUE),
+    HBP = sum(HBP, na.rm = TRUE),
+    `1B` = sum(`1B`, na.rm = TRUE),
+    `2B` = sum(`2B`, na.rm = TRUE),
+    `3B` = sum(`3B`, na.rm = TRUE),
+    HR = sum(HR, na.rm = TRUE),
+    AB = sum(AB, na.rm = TRUE),
+    SF = sum(SF, na.rm = TRUE)
+  )
+
+# Step 4: Compute wOBA numerator and denominator
+woba_numerator <- with(league_totals,
+  wBB * BB + wHBP * HBP + w1B * `1B` + w2B * `2B` + w3B * `3B` + wHR * HR
+)
+woba_denominator <- with(league_totals, AB + BB + SF + HBP)
+
+# Final wOBA
+league_woba <- woba_numerator / woba_denominator
+cat("League-wide wOBA (2025):", round(league_woba, 3), "\n")
+
+xwoba_adj_numerator <- wBB * league_totals$BB +
+                       wHBP * league_totals$HBP +
+                       sum(merged2024$sum_xwOBA_adjusted, na.rm = TRUE)
+
+xwoba_denominator <- league_totals$AB + league_totals$BB + league_totals$SF + league_totals$HBP
+
+league_xwoba_adjusted <- xwoba_adj_numerator / xwoba_denominator
+cat("League-wide xwOBA_adjusted (2025):", round(league_xwoba_adjusted, 3), "\n")
+
+```
+
+
+```{r}
+saveRDS(xgb_model, "C:/Users/franc/OneDrive/Hawks25/xgb_xwoba_model.rds")
+
+```
+
+```{r}
+mean(merged2024$wOBA - merged2024$xwOBA_adjusted, na.rm = TRUE)
+mean(merged2024$wOBA, na.rm=TRUE)
+mean(merged2024$xwOBA_adjusted, na.rm=TRUE)
+```
+
+```{r}
+t.test(merged2024$wOBA, merged2024$xwOBA_adjusted, 
+       alternative = "two.sided", paired = TRUE)
+```
+
+
+```{r}
+# ---- INDIVIDUAL PREDICTION: PROBABILITIES ONLY ----
+
+# Create a custom input
+newdata <- data.frame(
+  ExitSpeed = c(96.77),     # mph
+  Angle = c(36.62),         # degrees
+  Direction = c(4.15)      # degrees (0 = CF, neg = LF, pos = RF)
+)
+
+# Predict class probabilities using the XGBoost model
+indiv_pred <- predict(xgb_model, as.matrix(newdata))
+indiv_pred <- matrix(indiv_pred, ncol = 5, byrow = TRUE)
+colnames(indiv_pred) <- c("Out", "Single", "Double", "Triple", "HomeRun")
+
+# Output the probabilities
+indiv_probs <- as.data.frame(indiv_pred)
+print(indiv_probs)
+
+```
+```{r}
+# Step 1: Only include rows where model was used
+bip_2025 <- xwoba2024 %>%
+  filter(use_model)
+
+# Step 2: Extract predicted class labels from highest probability
+bip_2025 <- bip_2025 %>%
+  mutate(
+    Predicted = factor(colnames(predicted_probs)[max.col(predicted_probs)], levels = c("Out", "Single", "Double", "Triple", "HomeRun")),
+    Actual = factor(PlayResult, levels = c("Out", "Single", "Double", "Triple", "HomeRun"))
+  )
+
+library(caret)
+
+conf_matrix_2025 <- confusionMatrix(bip_2025$Predicted, bip_2025$Actual)
+print(conf_matrix_2025)
+
+# Create one-hot encoded actual matrix
+actual_matrix_2025 <- model.matrix(~ Actual - 1, data = bip_2025)
+colnames(actual_matrix_2025) <- levels(bip_2025$Actual)
+
+# Predicted probability matrix
+pred_matrix_2025 <- as.matrix(bip_2025[, c("Out", "Single", "Double", "Triple", "HomeRun")])
+
+# Compute Brier Score
+brier_score_2025 <- mean((pred_matrix_2025 - actual_matrix_2025)^2)
+cat("Brier Score (2025):", brier_score_2025, "\n")
+
+# Actual class index (0-based)
+actual_class_idx_2025 <- as.numeric(bip_2025$Actual)
+
+# Log loss
+log_loss_2025 <- -mean(log(pred_matrix_2025[cbind(1:nrow(pred_matrix_2025), actual_class_idx_2025)]))
+cat("Log Loss (2025):", log_loss_2025, "\n")
+
+```
+
+```{r}
+library(ggplot2)
+ggplot(merged2024, aes(x = wOBA, y = xwOBA_adjusted)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Player-level xwOBA vs. wOBA", x = "Actual wOBA", y = "xwOBA Adjusted")
+
+```
