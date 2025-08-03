@@ -1,173 +1,174 @@
 library(shiny)
 library(tidyverse)
 library(DT)
+library(xgboost)
 library(plotly)
 
-pitching_df <- read_csv("necbl_combined_pitching_stats.csv", show_col_types = FALSE)
-batting_df <- read_csv("necbl_combined_batting_stats.csv", show_col_types = FALSE)
+# ---- Load Data ----
+df <- read_csv("Test2025_combined.csv")
 
-# UI
+# ---- Load Trained xwOBA Model ----
+xgb_model <- readRDS("xgb_xwoba_model.rds")
+
+# ---- Prepare and Format Batter Names ----
+df <- df %>%
+  filter(BatterTeam == "UPP_VAL") %>%
+  filter(!is.na(Batter)) %>%
+  filter(!is.na(AutoPitchType)) %>%
+  mutate(
+    Batter = str_trim(Batter),
+    LastName = toupper(str_extract(Batter, "^[^,]+")),
+    FirstInitial = toupper(str_sub(str_extract(Batter, ",\\s*\\w"), -1)),
+    BatterFormatted = paste0(LastName, ", ", FirstInitial)
+  )
+
+nighthawks_df <- df
+
+# ---- UI ----
 ui <- fluidPage(
-  titlePanel("NECBL 2025 Dashboard"),
+  titlePanel("Upper Valley Nighthawks - Game-by-Game Hitter Reports"),
   
-  tabsetPanel(
-    tabPanel("Batting Percentiles",
-             br(),
-             fluidRow(
-               column(4,
-                      numericInput("minPA", "Minimum PA:", value = 0, min = 0, step = 10)
-               ),
-               column(4,
-                      selectInput("team", "Select Team:",
-                                  choices = c("All", unique(batting_df$Team)),
-                                  selected = "All")
-               )
+  do.call(tabsetPanel, c(id = "player_tabs", lapply(unique(nighthawks_df$BatterFormatted), function(player) {
+    safe_id <- make.names(player)
+    tabPanel(player,
+             selectInput(
+               inputId = paste0("date_", safe_id),
+               label = "Select Game Date",
+               choices = NULL
              ),
-             DTOutput("batting_table"),
+             DTOutput(outputId = paste0("pitch_table_", safe_id)),
+             br(),
+             plotlyOutput(outputId = paste0("chase_take_plot_", safe_id), height = "600px"),
              br(),
              wellPanel(
-               h4("Batting Stat Descriptions"),
-               tags$ul(
-                 tags$li(strong("wOBA:"), " Weighted On-Base Average. Weights each on base event (BB, HBP, 1B, 2B, 3B, HR) appropriately based on its average impact on run scoring."),
-                 tags$li(strong("xwOBA_adjusted:"), " Expected Weighted On-Base Average. Estimates what wOBA should be based on quality of contact on BIP"),
-                 tags$li(strong("diff_adjusted:"), " Difference between actual and expected wOBA. Positive numbers indicate a batter is unlucky and negative numbers indicate a batter is lucky"),
-                 tags$li(strong("xwOBA_per_BIP:"), " Expected wOBA per ball in play. The average expected value of all BIP for a batter."),
-               )
-             )
-    ),
-    
-    tabPanel("Pitching Percentiles",
-             br(),
-             fluidRow(
-               column(4,
-                      numericInput("minIP", "Minimum IP:", value = 0, min = 0, step = 5)
-               ),
-               column(4,
-                      selectInput("pitch_team", "Select Team:",
-                                  choices = c("All", unique(pitching_df$Team)),
-                                  selected = "All")
-               )
-             ),
-             DTOutput("pitching_percentiles_table"),
-             br(),
-             wellPanel(
-               h4("Pitching Stat Descriptions"),
-               tags$ul(
-                 tags$li(strong("Actual Run Value / 100:"), "Average run value per 100 pitches. Every pitch outcome has an average run value attached to it that will either increase or decrease the expected runs scored for the batting team:
-                         Ball: +0.056
-                         Strike: -0.089
-                         HBP: +0.31
-                         Out: -0.26
-                         1B: +0.44
-                         2B: +0.75
-                         3B: +1.01
-                         HR: +1.4
-                         A pitcher hopes this statistic is negative. It reads as: When this pitcher throws a pitch, on average he will either reduce the expected runs scored of the batting team by x (when negative) or increase the expected runs of the batting team by x (when positive). This is a per 100 pitches statistic"),
-                 tags$li(strong("Expected Run Value / 100:"), " Expected run value per 100 pitches. This statistic estimates what the actual run value per 100 pitches should be based on the quality of pitch thrown by the pitcher. The interpretation is essentially the same as actual run value per 100 pitches, but it takes into consideration how well a pitcher is executing each pitch."),
-                 tags$li(strong("Difference / 100:"), "Expected minus actual run value. A negative value indicates actual run value per 100 should be lower than it currently is, meaning a pitcher has been unlucky. A positive number means actual run value per 100 should be greater than it currently is, meaning the pitcher has been lucky.")
-               )
+               h4("Chase/Take Plot Explanation"),
+               p("This plot shows whether the hitter made a good decision based on pitch location."),
+               p("Circles indicate good decisions (swinging at strikes or taking balls)."),
+               p("Squares indicate poor decisions (chasing balls or taking strikes).")
              )
     )
-  )
+  })))
 )
 
-# Server
-server <- function(input, output) {
+# ---- Server ----
+server <- function(input, output, session) {
+  players <- unique(nighthawks_df$BatterFormatted)
+  non_swing_calls <- c("BallCalled", "BallinDirt", "StrikeCalled", "BallIntentional", "HitByPitch")
   
-  output$batting_table <- renderDT({
-    df <- batting_df %>%
-      filter({if (input$team != "All") Team == input$team else TRUE}) %>%
-      filter(PA >= input$minPA) %>%
-      mutate(
-        OBP_Pctl = percent_rank(OBP) * 100,
-        SLG_Pctl = percent_rank(SLG) * 100,
-        OPS_Pctl = percent_rank(OPS) * 100,
-        wOBA_Pctl = percent_rank(wOBA) * 100,
-        xwOBA_Pctl = percent_rank(xwOBA_adjusted) * 100,
-        Diff_Pctl = percent_rank(diff_adjusted) * 100,
-        xwOBA_per_BIP_Pctl = percent_rank(xwOBA_per_BIP) * 100
-      ) %>%
-      mutate(across(c(wOBA, xwOBA_adjusted, diff_adjusted, xwOBA_per_BIP,
-                      OBP, SLG, OPS,
-                      OBP_Pctl, SLG_Pctl, OPS_Pctl,
-                      wOBA_Pctl, xwOBA_Pctl, Diff_Pctl, xwOBA_per_BIP_Pctl),
-                    ~round(.x, 3)))
-    
-    datatable(df %>%
-                select(Player, Team, PA,
-                       wOBA, wOBA_Pctl,
-                       xwOBA_adjusted, xwOBA_Pctl,
-                       diff_adjusted, Diff_Pctl,
-                       xwOBA_per_BIP, xwOBA_per_BIP_Pctl,
-                       OBP, OBP_Pctl,
-                       SLG, SLG_Pctl,
-                       OPS, OPS_Pctl),
-              options = list(pageLength = 25),
-              rownames = FALSE) %>%
-      formatStyle(
-        columns = c('wOBA_Pctl', 'xwOBA_Pctl', 'Diff_Pctl', 'xwOBA_per_BIP_Pctl',
-                    'OBP_Pctl', 'SLG_Pctl', 'OPS_Pctl'),
-        background = styleColorBar(c(0, 100), 'lightblue'),
-        backgroundSize = '90% 60%',
-        backgroundRepeat = 'no-repeat',
-        backgroundPosition = 'center'
-      )
-  })
-  
-  
-  output$pitching_percentiles_table <- renderDT({
-    df <- pitching_df %>%
-      filter({if (input$pitch_team != "All") Team == input$pitch_team else TRUE}) %>%
-      filter(IP >= input$minIP) %>%
-      mutate(
-        # Scale run value metrics per 100 pitches
-        xRV_100 = avg_xRunValue * 100,
-        aRV_100 = avg_ActualRunValue * 100,
-        diff_100 = -1*difference * 100,
+  for (player in players) {
+    local({
+      player_copy <- player
+      safe_id <- make.names(player_copy)
+      
+      observe({
+        player_data <- nighthawks_df %>% filter(BatterFormatted == player_copy)
+        game_dates <- unique(player_data$Date) %>% sort()
+        updateSelectInput(session, inputId = paste0("date_", safe_id), choices = game_dates)
+      })
+      
+      render_game_data <- reactive({
+        req(input[[paste0("date_", safe_id)]])
+        player_game_data <- nighthawks_df %>%
+          filter(BatterFormatted == player_copy, Date == input[[paste0("date_", safe_id)]])
         
-        # Percentiles (higher is better for reverse stats like ERA)
-        ERA_Pctl = (1 - percent_rank(ERA)) * 100,
-        WHIP_Pctl = (1 - percent_rank(WHIP)) * 100,
-        FIP_Pctl = (1 - percent_rank(FIP)) * 100,
-        xRV_Pctl = (1 - percent_rank(xRV_100)) * 100,
-        aRV_Pctl = (1 - percent_rank(aRV_100)) * 100,
-        diffRV_Pctl = (1-percent_rank(diff_100)) * 100
-      ) %>%
-      mutate(across(
-        c(ERA, WHIP, FIP, xRV_100, aRV_100, diff_100,
-          ERA_Pctl, WHIP_Pctl, FIP_Pctl, xRV_Pctl, aRV_Pctl, diffRV_Pctl),
-        ~ round(.x, 3)
-      ))
-    
-    datatable(df %>%
-                select(Player, Team, IP,
-                       ERA, ERA_Pctl,
-                       WHIP, WHIP_Pctl,
-                       FIP, FIP_Pctl,
-                       xRV_100, xRV_Pctl,
-                       aRV_100, aRV_Pctl,
-                       diff_100, diffRV_Pctl),
-              options = list(pageLength = 25),
-              rownames = FALSE,
-              colnames = c(
-                "Player", "Team", "IP",
-                "ERA", "ERA_Pctl",
-                "WHIP", "WHIP_Pctl",
-                "FIP", "FIP_Pctl",
-                "Expected Run Value / 100", "xRV_Pctl",
-                "Actual Run Value / 100", "aRV_Pctl",
-                "Difference / 100", "Diff_Pctl"
-              )) %>%
-      formatStyle(
-        columns = c('ERA_Pctl', 'WHIP_Pctl', 'FIP_Pctl',
-                    'xRV_Pctl', 'aRV_Pctl', 'diffRV_Pctl'),
-        background = styleColorBar(c(0, 100), 'lightblue'),
-        backgroundSize = '90% 60%',
-        backgroundRepeat = 'no-repeat',
-        backgroundPosition = 'center'
-      )
-  })
+        model_rows <- which(
+          player_game_data$PitchCall == "InPlay" &
+            !is.na(player_game_data$ExitSpeed) &
+            !is.na(player_game_data$Angle) &
+            !is.na(player_game_data$Direction)
+        )
+        
+        prob_cols <- c("Out", "Single", "Double", "Triple", "HomeRun")
+        for (col in prob_cols) player_game_data[[col]] <- NA_real_
+        
+        if (length(model_rows) > 0) {
+          input_matrix <- as.matrix(player_game_data[model_rows, c("ExitSpeed", "Angle", "Direction")])
+          pred_probs <- predict(xgb_model, input_matrix)
+          pred_probs <- matrix(pred_probs, ncol = 5, byrow = TRUE)
+          colnames(pred_probs) <- prob_cols
+          player_game_data[model_rows, prob_cols] <- pred_probs
+        }
+        
+        woba_weights <- c("Out" = 0, "Single" = 0.882, "Double" = 1.254, "Triple" = 1.59, "HomeRun" = 2.05)
+        player_game_data <- player_game_data %>%
+          mutate(xwOBA = case_when(
+            !is.na(Single) ~ Out * woba_weights["Out"] +
+              Single * woba_weights["Single"] +
+              Double * woba_weights["Double"] +
+              Triple * woba_weights["Triple"] +
+              HomeRun * woba_weights["HomeRun"],
+            TRUE ~ woba_weights[as.character(PlayResult)]
+          )) %>%
+          mutate(across(c(
+            Out, Single, Double, Triple, HomeRun, xwOBA,
+            ExitSpeed, Angle, Direction,
+            PlateLocHeight, PlateLocSide,
+            RelSpeed, SpinRate, VertBreak, HorzBreak
+          ), ~ round(.x, 2)))
+        
+        return(player_game_data)
+      })
+      
+      output[[paste0("pitch_table_", safe_id)]] <- renderDT({
+        render_game_data() %>%
+          select(
+            PitcherThrows, BatterSide, Balls, Strikes, AutoPitchType,
+            PitchCall, PlayResult,
+            ExitSpeed, Angle, Direction,
+            PlateLocHeight, PlateLocSide,
+            RelSpeed, SpinRate, VertBreak, HorzBreak,
+            Out, Single, Double, Triple, HomeRun, xwOBA
+          )
+      })
+      
+      output[[paste0("chase_take_plot_", safe_id)]] <- renderPlotly({
+        data <- render_game_data() %>%
+          filter(!is.na(PlateLocHeight), !is.na(PlateLocSide)) %>%
+          mutate(
+            InZone = PlateLocSide >= -0.85 & PlateLocSide <= 0.85 &
+              PlateLocHeight >= 1.5 & PlateLocHeight <= 3.5,
+            GoodDecision = case_when(
+              InZone & !(PitchCall %in% non_swing_calls) ~ TRUE,
+              !InZone & PitchCall %in% non_swing_calls ~ TRUE,
+              TRUE ~ FALSE
+            ),
+            shape = if_else(GoodDecision, "circle", "square"),
+            hover_text = if_else(
+              PitchCall == "InPlay",
+              paste0("Pitch Type: ", AutoPitchType, "<br>",
+                     "Count: ", Balls, "-", Strikes, "<br>",
+                     "PitchCall: ", PitchCall, "<br>",
+                     "PlayResult: ", PlayResult, "<br>",
+                     "Out: ", Out, ", 1B: ", Single, ", 2B: ", Double, ", 3B: ", Triple, ", HR: ", HomeRun),
+              paste0("Pitch Type: ", AutoPitchType, "<br>",
+                     "Count: ", Balls, "-", Strikes, "<br>",
+                     "PitchCall: ", PitchCall, "<br>",
+                     "PlayResult: ", PlayResult)
+            )
+          )
+        
+        if (nrow(data) == 0) return(NULL)
+        
+        plot_ly(data,
+                x = ~PlateLocSide, y = ~PlateLocHeight,
+                type = "scatter", mode = "markers",
+                symbol = ~shape,
+                symbols = c("circle", "square"),
+                color = ~AutoPitchType,
+                text = ~hover_text,
+                hoverinfo = "text",
+                marker = list(size = 8, line = list(width = 1, color = "black"))
+        ) %>%
+          layout(
+            title = "Chase/Take Analysis",
+            xaxis = list(title = "PlateLocSide", range = c(-4, 4), scaleanchor = "y", scaleratio = 1),
+            yaxis = list(title = "PlateLocHeight", range = c(0, 5)),
+            shapes = list(list(type = "rect", x0 = -0.85, x1 = 0.85, y0 = 1.5, y1 = 3.5, line = list(color = "red")))
+          )
+      })
+    })
+  }
 }
 
-# Run the app
+# ---- Run App ----
 shinyApp(ui = ui, server = server)
